@@ -1,0 +1,563 @@
+---
+title: " Análisis de datos ómicos PEC2 Análisis RNA-seq"
+author: "María Ramírez García"
+date: "18/05/2025"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    theme: cerulean
+    highlight: textmate
+    number_sections: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r class.source = 'fold-hide', setup, include=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=FALSE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+# Exploración de expresión génica diferencial en COVID-19
+
+El análisis de perfiles de expresión génica permite entender mejor cómo responde nuestro organismo frente a distintas infecciones. En este trabajo, se utiliza información obtenida por McClain et al., quienes realizaron secuenciación de ARN en sangre periférica de pacientes con COVID-19, neumonía bacteriana, influenza, IRA (infección respiratoria aguda) y personas sanas. A partir de estos datos, se lleva a cabo un estudio de expresión diferencial utilizando R y Bioconductor, enfocándonos en identificar genes que cambian significativamente su expresión en cada grupo. Para el análisis se filtran los datos, trabajando con una muestra de individuos con COVID-19, neumonía bacteriana y sanos, se explora su distribución y agrupamiento según su perfil transcripcional, además de un estudio de expresión diferencial y de sobrerepresentación Este enfoque busca aportar nuevas pistas sobre biomarcadores útiles para el diagnóstico diferencial de infecciones respiratorias agudas.
+
+# Objetivos del análisis.
+
+A continuación, se plantean los objetivos específicos que guían este análisis de expresión diferencial:
+
+-   Analizar la expresión génica diferencial entre pacientes con COVID-19, neumonía bacteriana y sujetos sanos.
+
+-   Visualizar la distribución y agrupación de muestras según el perfil transcripcional.
+
+-   Comparar los genes con expresión diferencial en COVID-19 vs. sanos y neumonía bacteriana vs. sanos, identificando biomarcadores comunes y específicos.
+
+-   Relacionar los genes con expresión diferencial en COVID-19 con procesos biológicos.
+
+# Datos para el análisis
+
+## Preparación de los datos
+
+```{r directorios, include=FALSE}
+# Preparación de directorios
+workingDir <-getwd()
+dataDir <- file.path(workingDir, "data")
+resultsDir <- file.path(workingDir, "results")
+```
+
+```{r paquetes, include=FALSE}
+# Paquetes requeridos
+if (!require(Rsubread)) BiocManager::install("Rsubread") # Alineación y cuantificación de lecturas
+if (!require(edgeR))BiocManager::install("edgeR") # Pre-procesado, visualización y análisis de datos de contajes
+if (!require(limma))BiocManager::install("limma") # Análisis de expresión diferencial.
+if (!require(pheatmap))BiocManager::install("pheatmap") # Editar mapas de calor
+if (!require(org.Mm.eg.db))BiocManager::install("org.Mm.db")
+if (!require(clusterProfiler))BiocManager::install("clusterProfiler")
+if (!require(factoextra)) install.packages("factoextra", dep=TRUE)
+if (!require(GEOquery))BiocManager::install("GEOquery")
+if (!require(SummarizedExperiment))BiocManager::install("SummarizedExperiment")
+if (!require(EnsDb.Hsapiens.v86))BiocManager::install("EnsDb.Hsapiens.v86")
+if (!require(tidyverse))BiocManager::install("tidyverse")
+if (!require(RNAseq123))BiocManager::install("RNAseq123")
+if (!require(DESeq2))BiocManager::install("DESeq2")
+```
+
+Desde la página de GEO a través del identificador GSE161731, se descargaron manualmente los archivos GSE161731_counts.csv.gz y GSE161731_key.csv.gz, que contienen la matriz de recuentos de expresión génica y los metadatos de las muestras, respectivamente. Ambos archivos se cargaron en R y se crearon dos objetos *counts* y *metadata* con el contenido de cada archivo, para la construcción de un objeto SummarizedExperiment, el cual requiere información en común para vincular correctamente las matrices de datos. Al explorar los datos se observó que, en los identificadores de muestra, hay pequeñas diferencias de formato: en la matriz de conteos algunos nombres comenzaban con una “X” y los guiones (“-”) estaban reemplazados por puntos (“.”). Se realizaron las modificaciones necesarias eliminando las “X” iniciales y reemplazando los puntos por guiones, de forma que los identificadores de las muestras quedaron idénticos en ambos objetos. Finalmente se eliminan los registros de *count* que no coinciden con *metadata* permitiendo así identificar y conservar únicamente las muestras en común.
+
+```{r carga_los_datos, include=FALSE}
+# Carga y lectura de archivos
+# Cargar la matriz de recuentos
+counts <- read.csv(file.path(dataDir, "GSE161731_counts.csv.gz"), row.names = 1)
+# Cargar los metadatos de las muestras
+metadata <- read.csv(file.path(dataDir, "GSE161731_key.csv.gz"), row.names = 1)
+
+# Exploración de los datos
+# Exploración de la matriz de recuentos
+head(counts)
+colnames(counts)
+# Exploración de metadatos de muestras
+head(metadata)
+rownames(metadata)
+```
+
+```{r Normalizar_nombres_de_muestra, include=FALSE}
+# Normalizar nombres de columnas en counts para que coincidan con metadata
+colnames(counts) <- gsub("^X", "", colnames(counts))    # elimina X inicial
+colnames(counts) <- gsub("\\.", "-", colnames(counts))  # cambia puntos por guiones
+
+# Comprobar que coinciden 
+length(intersect(colnames(counts), rownames(metadata))) # Muestras que coinciden en la matriz de recuentos con los metadatos.
+# Numero de muestras en ambos
+length(colnames(counts))
+length(rownames(metadata))
+# Descartamos las muestras que no son comunes y reorganizamos los datos
+comun_muestras <- intersect(colnames(counts), rownames(metadata))
+counts <- counts[, comun_muestras] # En las columnas, solo las muestras que son comunes
+metadata <- metadata[comun_muestras, ] # En las filas, solo las muestras communes
+```
+
+Posteriormente, se ajustaron los tipos de datos de las variables contenidas en el metadata. La mayoría se encontraban como carácter, por lo que se convirtieron a factor.
+
+En el caso de la variable edad, antes de transformarla a tipo numérico, se reemplazaron los valores "\>89" por "90" y los "\<1" por "0", evitando de esta forma la generación de valores NA y permitiendo tratarla como una variable continua en los análisis posteriores. La edad, puede representar un posible factor confusor, por lo que se tendra en cuenta en los modelos de análisis que se realizaran más adelante, esta puede modular la respuesta inmune y, por ende, alterar los perfiles transcripcionales. Al tratar la edad como variable numérica continua, pueden surgir problemas de colinealidad o errores de convergencia en ciertos modelos. Convertirla a factor podría sobreajustar al aumentar el número de parámetros, y escalarla facilitaría la convergencia, pero podría perder efectos no lineales o diferencias importantes entre rangos de edad.
+
+Como estrategia equilibrada, se decidió conservar la variable edad en formato numérico y, de forma complementaria, crear una nueva variable categórica que agrupa los sujetos en intervalos de edad predefinidos. Esta decisión permite comparar resultados utilizando ambas versiones y explorar su influencia como factor de confusión o modificador en los análisis de expresión diferencial y visualizaciones multivariadas.
+
+```{r categoría_de_las_variables, include=FALSE}
+# Categoria de las columnas de metadatos
+str(metadata) # Comprueba el tipo de cada variable, la mayoria estan como cadena
+# Cambio a factor 
+metadata <- metadata %>% mutate(across(c(gender, race, cohort,time_since_onset, hospitalized, batch), as.factor))
+# Cambio a numérico
+metadata <- metadata %>% mutate(age = case_when( age == ">89" ~ 90, age == "<1"  ~ 0, TRUE ~ as.numeric(age)))
+which(is.na(metadata$age)) # comprueba que no hay NA
+# Crear nueva variable 'grupo_edad' agrupando por rangos
+# metadata$g_age <- cut(metadata$age, breaks = c(0, 15, 30, 45, 60, 75, 90), labels = c("0-15", "15-30", "31-45", "46-60", "61-75", "76-90"), right = TRUE, include.lowest = TRUE)  # Elimino esta variable, da problemas a la hora de crear y exportar el documento. Cuando lo ejecujo poco a poco no tengo problemas.
+```
+
+Finalmente, se prepararon los objetos correspondientes para colData (metadata) y assays (counts), y se añadieron las coordenadas génicas a rowData utilizando el paquete EnsDb.Hsapiens.v86. Para ello, se descargó la base completa de genes humanos y se seleccionaron únicamente aquellos presentes en la matriz de recuentos. Con todos estos objetos listos, se construyó el objeto SummarizedExperiment, integrando la matriz de recuentos, la información de las muestras y los datos asociados a los genes.
+
+```{r Añadir_coordenadas_génicas, include=FALSE}
+# Obtener coordenadas de todos los genes humanos
+cor_genes <- genes(EnsDb.Hsapiens.v86)
+
+# Identificar genes comunes entre counts y las coordenadas de todos los genes
+comun_genes <- intersect(rownames(counts), names(cor_genes))
+
+# Filtrar counts y cor_genes para seleccionar los comunes
+counts_fil <- counts[comun_genes, ]
+genes_fil <- cor_genes[comun_genes]
+
+# Verificar que son iguales
+identical(rownames(counts_fil), names(genes_fil))
+```
+
+```{r crear_summarizedExperiment, echo=TRUE}
+mySE <- SummarizedExperiment(
+  assays = list(counts = as.matrix(counts_fil)),
+  colData = metadata,
+  rowRanges = genes_fil
+)
+show(mySE)
+```
+
+Antes de continuar con el análisis, se realizó una limpieza y ajuste del objeto SummarizedExperiment (mySE). En primer lugar, se verificó la existencia de individuos duplicados en colData y, tras confirmar su presencia, se procedió a eliminar las duplicaciones, conservando únicamente la primera entrada de cada caso como criterio de selección. Como resultado, el número de muestras se redujo de 195 a 152.
+
+Posteriormente, se exploró nuevamente colData para comprobar la correcta tipificación de las variables, observando que gender y cohort se encuentran como factores, y age como variable numérica, de acuerdo con los ajustes realizados previamente. Además, se realizaron modificaciones en las variables categóricas race y cohort, sustituyendo caracteres que podrían generar inconvenientes durante el análisis en R (como espacios en blanco, guiones o barras) por el carácter “\_”.
+
+Para definir las cohortes de interés, se visualizó la distribución de muestras en cada grupo disponible y, a continuación, se seleccionaron las muestras correspondientes a COVID19, Bacterial y Healthy para los análisis posteriores. Finalmente, tras realizar estas depuraciones, se seleccionaron 75 muestras de forma aleatoria utilizando una semilla de aleatoriedad establecida, garantizando así la reproducibilidad del análisis.
+
+```{r limpieza_y_selección, include=FALSE}
+# Revisar si hay muestras duplicadas
+any(duplicated(colData(mySE)$subject_id))
+# Si hay duplicados, eliminar manteniendo la primera entrada
+mySE <- mySE[, !duplicated(colData(mySE)$subject_id)]
+```
+
+```{r echo=TRUE}
+show(mySE)
+str(colData(mySE))
+```
+
+```{r categorias_mySE, include=FALSE}
+# Cambiar simbolos en las variables raza y cohorte.
+colData(mySE)$cohort <- as.factor(gsub(" |-|/", "_", colData(mySE)$cohort))
+colData(mySE)$race   <- as.factor(gsub(" |-|/", "_", colData(mySE)$race))
+```
+
+```{r selección_cohortes, echo=TRUE}
+# Visualización de cohortes
+table(colData(mySE)$cohort)
+# Selección de COVID19, Bacterial y healthy.
+mySE <- mySE[, colData(mySE)$cohort %in% c("COVID_19", "Bacterial", "healthy")]
+```
+
+```{r selección_semilla, include=FALSE}
+# Semilla
+myseed <- sum(utf8ToInt("mariaramirezgracia")) 
+set.seed(myseed)
+# Selección
+selec_muestras <- sample(colnames(mySE), 75)
+mySE <- mySE[, selec_muestras]
+```
+
+```{r verifica_los_resultados, echo=TRUE}
+# Verificar los resultados
+mySE
+table(colData(mySE)$cohort)
+```
+
+## Preprocesado y normalización de datos
+
+Tras preparar los datos para comenzar el análisis y revisar que se han efectuado los cambios necesarios, se realiza el preprocesado inicial de los datos y su normalización.
+
+Los genes con recuentos muy bajos en todas las librerías aportan poco valor al análisis diferencial e interfieren con algunas de las aproximaciones estadísticas. Por ello los genes se filtran según la expresión, eliminando aquellos con una expresión muy baja. Antes de filtrar se estandarizan los contajes basándose en el tamaño de la librería. Para ello se normalizan los contajes brutos para las diferentes profundidades de secuenciación para cada muestra. Esta se lleva a cabo con el paquete *edgerR* y su función *cpm()*, posteriormente se guardan los valores CPM (recuento por millón) obtenidos, en un nuevo *assay* (CPM) del *mySE*.
+
+```{r obtención_CPM, include=FALSE}
+# Calcular CPM de los counts del SummarizedExperiment
+counts_CPM <- cpm(assay(mySE, "counts"))
+# Almacena los datos de expresión normalizada como un nuevo ensayo
+assay(mySE, "CPM") <- counts_CPM
+```
+
+Una vez obtenidos los valores CPMs, se filtran los genes, eliminando los genes que su expresión sea inferior a 0,5 CPM en al menos dos muestras. Los datos obtenidos del filtraje se guardan en un nuevo SummarizedExperiment (*mySE_filt*), creado a partir del anterior
+
+```{r filtrado, echo=TRUE}
+# Filtrar los genes
+triaje <- counts_CPM > 0.5 # Matriz booleana con TRUE donde CPM > 0.5
+triaje_genes <- rowSums(triaje) >= 2 # Genes con al menos 2 muestras con CPM > 0.5
+
+# Aplica el filtraje al SummarizedExperiment mySE y guarda uno nuevo con los datos filtrados
+mySE_filt <- mySE[triaje_genes, ]
+
+# Verificar número de genes tras el filtrado
+dim(assay(mySE, "CPM"))# Dimensiones sin filtrar genes
+dim(assay(mySE_filt, "CPM")) # Dimensiones con los genes filtrados
+```
+
+```{r orden_por_cohortes, include=FALSE}
+# Obtener orden de las muestras según cohort
+orden <- order(colData(mySE_filt)$cohort)
+# Reordenar el SummarizedExperiment según ese orden
+mySE_filt <- mySE_filt[, orden]
+# SE realiza para una mejora visual en los gráficos, sin añadir codigo extra
+```
+
+Se puede observar que después de descartar los genes con baja expresión su número se reduce considerablemente, sin filtrar encontrábamos 57.602 genes secuenciados y tras el filtrado se han obtenido 24.795 genes.
+
+Para trabajar los datos de manera más eficiente, se crea un objeto de clase específica para gestionar datos complejos, *DGEList*, del paquete *edgeR*. Una de las ventajas de manejar este objeto es usar la función *calcNormFactors* para calcular los factores de normalización entre librerías. De esta forma los datos siguen una normalización TMM que elimina los sesgos de comparación entre librerías.
+
+```{r Normalización_de_los_datos_con_DGEList, include=FALSE}
+# Crear objeto DGEList con los counts
+dge <- DGEList(counts = assay(mySE_filt, "counts"))
+
+# Normalizar al objeto DGEList
+dge_nor <- calcNormFactors(dge)
+
+# Obtener CPM normalizados
+cpm_dge_nor <- cpm(dge_nor, log = TRUE)
+```
+
+# Análisis exploratorio
+
+Tras descartar los genes con baja expresión se realizan gráficos exploratorios para ver la distribución de los datos, su calidad y si presentan algún problema.
+
+## Distribución de las mmuestras
+
+Se realizaron dos boxplots para explorar la distribución de los niveles de expresión génica en las muestras antes y después del proceso de normalización. Dado que los datos de conteo de secuenciación no siguen una distribución normal, se aplicó una transformación logarítmica (log2 CPM) para facilitar la visualización y comparación de las muestras.
+
+```{r colores_por_cohortes, include=FALSE}
+# Definir colores para cohortes
+colores <- c("Bacterial" = "tomato", "COVID_19" = "blue", "healthy" = "lightgreen")
+# Crear vector de colores según cohortes, 
+colores_muestras <- colores[as.character(colData(mySE_filt)$cohort)]
+```
+
+En el primer gráfico, se representan los valores de expresión sin normalizar. Se puede observar cierta heterogeneidad en las medianas y rangos intercuartílicos entre muestras y cohortes, lo cual es esperable debido a las diferencias en la profundidad de secuenciación y composición de las bibliotecas.
+
+Para facilitar la identificación de cada cohorte, las muestras se colorearon según su grupo de pertenencia: COVID-19 (azul), Bacterial (rojo) y Healthy (verde claro).
+
+La línea horizontal azul indica la mediana global de expresión, sirviendo como referencia para detectar muestras con distribuciones atípicas o desviadas.
+
+```{r boxplot_sin_normalizar, echo=FALSE}
+# Obtener CPM de dge
+cpm_dge <- cpm(dge, log = TRUE) 
+# Gráfico con contajes sin normalizar
+# Boxplot para observar la distribución de las muestras
+boxplot(cpm_dge, las = 2, cex.axis=0.7, main = "Distribución de expresión por muestra (sin normalizar)", ylab = "Log2 CPM", xlab="",cex.main=0.8, col=colores_muestras)
+abline(h=median(cpm_dge), col="darkblue") # Agreguemos una línea horizontal azul que corresponde a la mediana logCPM 
+```
+
+*Figura1: Boxplot para la distribución de muestras sin normalizar.*
+
+```{r boxplot_normalizadas, echo=FALSE}
+# Gráfico con contajes normalizado
+# Boxplot para observar la distribución de las muestras
+boxplot(cpm_dge_nor, las = 2, cex.axis=0.7, main = "Distribución de expresión por muestra ( normalizadas)", ylab = "Log2 CPM", xlab="",cex.main=0.8, col=colores_muestras)
+abline(h=median(cpm_dge_nor), col="darkblue") 
+```
+
+*Figura2: Boxplot para la distribución de muestras normalizadas.*
+
+Al comparar ambos gráficos, se ve que tras la normalización las distribuciones de las muestras se vuelven más homogéneas. Las medianas se alinean mejor y disminuyen los valores atípicos extremos. Esto facilita comparaciones más fiables entre grupos en los análisis posteriores.
+
+## Comparación entre muestras
+
+Con la finalidad de comparar las muestras entre sí, se calcula la matriz de distancia de las muestras, utilizando la función *dist* y posteriormente representando la distancia mediante agrupación jerárquica con un dendrograma y un heatmap.
+
+```{r matriz_de_distancias, include=FALSE}
+# Calculo de la matriz de distancias de las muestas
+muestras_dist <- dist(t(cpm_dge_nor))
+```
+
+```{r Dendrograma,, echo=FALSE}
+# Agrupamiento jerárquico: Dendrograma
+library(dendextend)
+# crea dendrograma
+dend <- as.dendrogram(hclust(muestras_dist))
+# Asignar colores a etiquetas
+labels_colors(dend) <- colores[as.character(colData(mySE_filt)$cohort)][order.dendrogram(dend)]
+# Acortar los nombres de las etiquetas a los primeros 6 caracteres
+labels(dend) <- substr(labels(dend), 1, 6) # Visualizar mejor el gráfico
+# Graficar dendrograma
+plot(dend, main = "Dendrograma de distancias de muestra", xlab = "Muestras", ylab = "Distancia Euclídea" )
+legend("topright", legend = names(colores), fill = colores, cex=0.5)
+```
+
+*Figura 3: Agrupamiento jerárquico de las muestras según la matriz de distancias. Nota: Para mejorar la visualización, los nombres de las muestras se han reducido.*
+
+En la *figura 3* se observa que el grupo de individuos con neumonía bacteriana aparece claramente separado del resto, formando un bloque diferenciado salvo por dos muestras que quedan algo desplazadas. Por el contrario, los individuos sanos y los pacientes con COVID-19 no muestran una separación tan marcada entre ellos, distribuyéndose de forma más mezclada.
+
+```{r Heatmap, echo=FALSE}
+# Crear un data.frame con los colores de cohortes
+annotation_col <- data.frame(Cohorte = colData(mySE_filt)$cohort)
+rownames(annotation_col) <- colnames(mySE_filt)
+
+# Definir los colores para cohortes
+ann_colors <- list(Cohorte = colores)
+
+# Heatmap de distancias
+pheatmap(muestras_dist,
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         main = "Heatmap de distancias entre muestras",
+         show_rownames = FALSE, # Oculta nombres de filas
+         show_colnames = FALSE, # Oculta nombres de columnas
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete")
+
+```
+
+*Figura 4: Heatmap de distancias*
+
+Al observar el heatmap, se confirma que el grupo de individuos con neumonía bacteriana es el que más se diferencia del resto, agrupándose de forma clara y consistente, como ya se había visto en los gráficos anteriores.
+
+Tanto en lel denograma como en el heatmap se observa que las muestras de neumonía bacteriana se diferencian claramente del resto, mientras que las de COVID-19 y healthy presentan perfiles de expresión muy similares entre sí.
+
+Para complementar los gráficos anteriores y comprobar si los agrupamientos de muestras son similares a los mostrados por el heatmaps y el dendrograma, se realiza un MDS (Multidimensional Scaling). Con este se puede observar en un espacio de dimensiones reducidas las relaciones de similitud entre las muestras, además se pueden detectar outliers o posible efecto batch. Para este grafico se utiliza *limma::plotMDS*.
+
+```{r MDS,, echo=FALSE}
+# Crear MDS para las muestras
+limma::plotMDS(cpm_dge_nor,col=colores_muestras, main="MDS por cohortes", cex=0.7)
+```
+
+*Figura 5: MDS por cohortes. Rojo: neumonia bacteriana; azul: COVID 19; verde: individuos sanos.*
+
+En el MDS destacan varios puntos que se apartan del núcleo de su cohorte y pueden considerarse outliers: dentro de la cohorte bacteriana sobresalen las muestras 95967, 97392 y 95996, todas desplazadas respecto al resto del grupo; en COVID-19 se alejan DU18-02S0011654, DU18-02S0011619 y DU18-02S0011639, situadas por debajo o a la derecha de la agrupación principal; y en healthy se dispersan las muestras DU09-02S000151, 153 y 156, ubicadas ligeramente por debajo del conjunto central.
+
+```{r Batch,, echo=FALSE}
+# Crear vector de colores para los batch
+batch_col <- unique(colData(mySE_filt)$batch)
+# Asignar colores a cada batch
+batch_colores <- rainbow(length(batch_col))
+names(batch_colores) <- batch_col
+# Asignar color a cada muestra según su batch
+col_batch <- batch_colores[as.character(colData(mySE_filt)$batch)]
+
+# Visualizar relación batch-color
+data.frame(Muestra = colnames(mySE), Batch = colData(mySE)$batch, Color = col_batch)
+
+# grafico 
+limma::plotMDS(cpm_dge_nor, col = col_batch, main = "MDS por Batch", cex = 0.7)
+
+# Leyenda
+legend("topright", legend = names(batch_colores), fill = batch_colores, cex=0.5)
+```
+
+*Figura 6: MDS según batch.*
+
+El análisis del posible efecto batch mostró que las muestras bacterianas más alejadas (95967, 97392, 94189) pertenecen al mismo lote que el resto de su cohorte, por lo que su distancia no se explica por el batch. En COVID-19 y healthy los puntos no se agrupan ni por cohorte ni por lote, de modo que el efecto batch tampoco justifica la dispersión observada. Se proponen como outliers visuales 95967, 97392 y 94189 (bacterial), DU18-02S0011619 y DU18-02S0011639 (COVID-19) y DU09-02S0000151 (healthy), aunque sería necesario fijar criterios objetivos de exclusión. En conjunto, los perfiles de neumonía bacteriana se distinguen claramente de los otros dos grupos, mientras que COVID-19 y healthy no muestran una separación definida.
+
+Además del batch, variables como edad, sexo y raza podrían actuar como factores de confusión; sin embargo, el objetivo principal es contrastar los perfiles de expresión de los pacientes con COVID-19 frente a los individuos sanos, y en ambos grupos la distribución de muestras resulta relativamente dispersa y sin fronteras bien definidas. Dado que esa variabilidad biológica ya complica la interpretación, y porque no existe evidencia clara de que los puntos alejados respondan a problemas técnicos (batch) u otros sesgos sistemáticos, se decidió conservar todas las muestras (including los posibles outliers) para no introducir un sesgo adicional eliminando datos cuyo comportamiento atípico aún no se comprende.
+
+```{r eliminación_outliers, echo=TRUE}
+# Posibles outliers
+outliers <- c("95967", "97392", "94189", "DU18-02S0011619", "DU18-02S0011639", "DU09-02S0000151")
+# Elimina outliers del SummarizedExperiment
+mySE_filt <- mySE_filt[, !colnames(mySE_filt) %in% outliers]
+dim(assay(mySE_filt, "CPM")) # Comprobbar que eliminó las 6 muestras (75-6=69)
+```
+
+# Análisis de expresión génica diferencial
+
+El analisis de expresión diferencial se realiza con el método DESeq2, este paquete permite crear un objeto DESeqDataSet a partir de un objeto RangedSummarizedExperiment (mySE_filt). Al crearse se designa la formula con las variables que se van a utilizar en el modelo, en esta debe situarse la variable de interés principal al final, en este caso cohorts, se debe tener en cuenta también que la categoría que toma de referencia es la primero, por lo tanto se define como referencia “healthy” para evitar que use otra categoría como tal. Además de la cohorte, la fórmula incorpora las posibles variables confusoras edad, batch, raza y género, ya que todas pueden influir en el perfil de expresión génica. Batch se incluye aunque el análisis exploratorio no mostrara un efecto evidente, de modo que cualquier impacto sutil quede controlado. El objeto resultante se denomina *dds*.
+
+```{r include=FALSE}
+# Selección del metodo para el analisis
+set.seed(myseed)
+metodo <- sample(c("edgeR", "voom+limma", "DESeq2"), size = 1)
+metodo
+```
+
+```{r creear objeto_S4, include=FALSE}
+# Situar heathly como referencia de los factores
+colData(mySE_filt)$cohort <- relevel(colData(mySE_filt)$cohort, ref = "healthy")
+
+# Elimina los niveles de cohort que estan vacios 
+colData(mySE_filt)$cohort <- droplevels(colData(mySE_filt)$cohort)
+levels(colData(mySE_filt)$cohort) # comprueba que solo quedan healthy, Bacterial y COVID_19
+
+# Crear objeto DESeqDataSet desde el RangedSummarizedExperiment (mySE_filt)
+library("DESeq2")
+dds <- DESeqDataSet(mySE_filt, design = ~ batch + race + gender + cohort)
+# Ejecutar
+dds <- DESeq(dds)
+```
+
+Una vez creado y ejecutado el objeto *dds*, se extrae la matriz de diseño que se ha generado a partir de la fórmula especificada. Esta matriz organiza y codifica las variables incluidas en el análisis, y sobre ella se basará el ajuste de los modelos estadísticos para evaluar las posibles diferencias de expresión génica.
+
+En *DESeq2*, a diferencia de otros paquetes como *lima*, no se crea una matriz de contrastes explícita previa al análisis. En su lugar, se ajusta un modelo lineal generalizado negativo binomial mediante una fórmula de diseño, y posteriormente se definen los contrastes al extraer los resultados con la función *results()*.
+
+```{r echo=TRUE}
+# Extrar las martiz de diseño
+matriz_dis <- model.matrix(design(dds), data=colData(dds)) # Extrae la fórmula con design(dds) y toma los datos de colData(dds).  
+```
+
+Para estudiar la expresión diferencial se plantean dos contrastes principales: **Bacterial vs Healthy** y **COVID-19 vs Healthy**. De este modo se identifican los genes cuyo nivel de expresión varía específicamente en los individuos con neumonía bacteriana, por un lado, y en los pacientes con COVID-19, por otro, siempre frente al mismo referente de sujetos sanos.
+
+```{r contrastes, echo=TRUE}
+# En DESeq2 los contrastes se especifican directamente al extraer los resultados con results(), no se crean matrices explicitas
+# Bacterial vs healthy
+res_bacterial <- results(dds, contrast = c("cohort", "Bacterial", "healthy"))
+head(res_bacterial) # Visualizar los resultados de los primeros genes
+
+# COVID-19 vs healthy
+res_covid <- results(dds, contrast = c("cohort", "COVID_19", "healthy"))
+head(res_covid) #Visualizar los resultados de los primeros genes
+
+# coeficientes para construir los contrastes
+resultsNames(dds)
+```
+
+Se aplicó un filtrado por criterios de significación, seleccionando genes con un valor ajustado de p inferior a 0.05 y una diferencia absoluta en log2FoldChange mayor a 1.5, lo que equivale a una diferencia de expresión de al menos 2.8 veces entre grupos. Este doble umbral permite garantizar que los genes seleccionados no solo presentan diferencias estadísticamente significativas, sino que estas son además biológicamente relevantes.
+
+```{r echo=TRUE}
+# Filtra valores con el p-valor ajustado <0.05 &
+# Filtra por una diferencia de expresión de al menos 2.8 veces entre los grupos.
+
+# Filtrar resultados para Bacterial vs healthy
+res_bacterial_sig <- res_bacterial[which(res_bacterial$padj < 0.05 & abs(res_bacterial$log2FoldChange) > 1.5), ] 
+head(res_bacterial_sig)
+nrow(res_bacterial_sig)  # Número de genes significativos y con alto cambio
+
+# Filtrar resultados para COVID-19 vs healthy
+res_covid_sig <- res_covid[which(res_covid$padj < 0.05 & abs(res_covid$log2FoldChange) > 1.5), ]
+head(res_covid_sig)
+nrow(res_covid_sig)  # Número de genes significativos y con alto cambio
+```
+
+## Contrastes para los perfiles con neumonía bacteriana y COVID-19
+
+Tras realizar el análisis diferencial de expresión y aplicar el filtrado de genes se seleccionan 2.454 genes para el perfil de neumonía bacteriana y 202 genes para COVID-19, ambos en comparación con individuos sanos.
+
+Para comparar los resultados de ambos contrastes (Bacterial vs healthy y COVID19 vs healthy). Se utiliza un diagrama de Venn.
+
+```{r}
+# Diagrama de Venn
+library("ggvenn")
+
+# Crea una lista con los genes diferencialmente expresados en cada contraste
+Venn<-list("Bacterial_vs_healthy"=c(rownames(res_bacterial_sig)),"COVID19 vs healthy"=c(rownames(res_covid_sig)))
+
+# Generar el diagrama de Venn con los conjuntos definidos
+ggvenn(Venn, fill_color = c( "tomato", "blue"),
+  stroke_size = 0.6, 
+  set_name_size = 6)
+```
+
+*Figura 7: Diagrama de Venn. Contraste para Bacterial vs Healthy y COVID-19 vs Healthy*
+
+La intersección del diagrama de Venn muestra 92 genes que se regulan de forma diferencial tanto en pacientes con neumonía bacteriana como en los afectados por COVID-19. El contraste Bacterial vs Healthy aporta 2 362 genes exclusivos, mientras que COVID-19 vs Healthy presenta 110 genes propios. Que exista un subconjunto común es esperable desde el punto de vista biológico: ambas condiciones implican infecciones respiratorias agudas y activan rutas inmunitarias compartidas.
+
+# Análisis de sobrerepresentación
+
+Se realizó un análisis de enriquecimiento GO con topGO sobre los genes encontrados en el análisis de expresión diferencial para COVID19. El universo incluyó 24 795 genes procedentes del objeto res_covid (DESeq2) y se definieron 324 genes de interés a partir de res_covid_fil (padj \< 0,05; \|log2FC\| \> 1,5), empleando identificadores Ensembl.
+
+Al crear el objeto topGOdata (ontología BP, paquete org.Hs.eg.db) se observó que 0 de los 324 genes contaban con anotación GO; el resumen indicó 24 795 genes disponibles, 14 226 factibles y 0 significativos. Esto impide obtener resultados útiles o cargarlos en REVIGO. Una posible causa es que la que la mayoría de los genes diferenciales corresponden a ncRNA, miRNA o pseudogenes sin términos GO en la base de anotación.
+
+```{r topGO, echo=FALSE}
+library(topGO)
+
+# Crea un vector con todos los genes y su log2FC
+geneList <- res_covid$log2FoldChange  # todos los genes evaluados
+names(geneList) <- rownames(res_covid)  # IDs como nombres
+geneList[is.na(geneList)] <- 0     # evita NAs
+
+# Lista de genes significativos creada anteriormente
+sigGenes <- rownames(res_covid_sig) 
+
+# Función de selección: TRUE cuando el gen está en sigGenes
+geneSelection <- function(allScore) {
+  names(allScore) %in% sigGenes }
+
+# Crear el objeto topGOdata
+GOdata <- new("topGOdata",
+              ontology      = "BP",
+              allGenes      = geneList,
+              geneSel       = geneSelection,
+              annotationFun = annFUN.org,
+              mapping       = "org.Hs.eg.db", 
+              ID            = "ENSEMBL")      # IDs de Ensembl
+
+# Visualizar 
+GOdata  # Resumen
+sum(geneSelection(geneList))  # número de genes seleccionados
+```
+
+Al no poder ejecutar un enriquecimiento GO efectivo, se pierde la oportunidad de vincular los cambios de expresión observados con procesos biológicos concretos, jerarquizar vías relevantes y generar hipótesis funcionales sobre la respuesta al SARS‑CoV‑2
+
+# Discursión y Conclusiones
+
+## Discusión
+
+Los resultados confirman que la neumonía bacteriana induce un cambio transcriptómico periférico mucho más marcado que COVID-19. La poca distancia observada entre los casos de COVID-19 y los individuos sanos indica que las muestras de COVID son heterogeneas. Para determinar mejor esas diferencias, convendría incorporar metadatos como tiempo desde síntomas o severidad en futuros modelos.
+
+Mientras que los genes compartidos entre perfiles de expresión ayudan a entender las vías comunes de infecciones respiratorias. Los genes exclusivos de cada cohorte son candidatos a biomarcadores diferenciales que podrían mejorar la clasificación de infecciones respiratorias en la práctica clínica.
+
+## Conclusiones
+
+-   Perfil transcriptómico distintivo en neumonía bacteriana: El MDS por cohorte y el heatmap de distancias coinciden en mostrar que las muestras bacterianas se agrupan y se alejan claramente de los grupos COVID-19 y healthy, lo que indica un perfil de expresión génica marcado. El contraste Bacterial vs Healthy revela 2 362 genes diferencialmente expresados, de los cuales 92 se comparten con COVID-19.
+
+-   Solapamiento entre COVID-19 y sujetos sanos: Las muestras COVID-19 y healthy se superponen en las proyecciones MDS y no forman clusters bien definidos en el heatmap y dendrograma, lo que apunta a diferencias de expresión más sutiles. COVID-19 vs Healthy muestra solo 110 genes exclusivos, lo que refuerza la idea de un cambio transcripcional moderado.
+
+-   Genes compartidos entre infecciones: Los 92 genes comunes a ambas comparaciones probablemente reflejan rutas inmunitarias generales, activadas ante infecciones respiratorias agudas.
+
+-   Efecto batch y muestras atípicas: El MDS coloreado por lote muestra que las muestras alejadas no se explican por batch. Se decidió eliminar estos outliers aunque su eliminación podría sesgar el análisis, ya que no se ha determinado la causa de su dispersión. Esta causa podría ser debida a las variables confusoras que no se han estudiado.
+
+## Limitación y problemas
+
+-   Dispersión de las muestras COVID-19 y healthy, dificulta detectar efectos sutiles.
+
+-   Tamaño de la muestra relativamente pequeño.
+
+-   A nivel del análisis de datos, se podría haber hecho un estudio más exhaustivo de las posibles variables confusoras. Con una mejor preparación y manipulación de los datos se podría haber realizado un buen estudio de sobreexpreión (no he podido anotar correctamente los genes en este paso)
+
+# Referencias
+
+Repositorio: <https://github.com/maria-r-g/Ramirez-Garcia-Maria-PEC2.git>
+
+Law C, Alhamdoosh M, Su S, Dong X, Tian L, Smyth G, Ritchie MR. RNAseq123: RNA-seq analysis is easy as 1-2-3 with limma, Glimma and edgeR [Internet]. Bioconductor; 2025 [citado 18 may 2025]. Disponible en: <https://www.bioconductor.org/packages/release/workflows/html/RNAseq123.html>
+
+McClain MT, Constantine FJ, Henao R, Liu Y, Tsalik EL, Burke TW, et al. Dysregulated transcriptional responses to SARS-CoV-2 in the periphery. Nat Commun. 2021;12:1079. Disponible en: <https://www.nature.com/articles/s41467-021-21289-y>
+
+NCBI GEO. GSE161731: Dysregulated transcriptional responses to SARS-CoV-2 in the periphery support novel diagnostic approaches [Internet]. Bethesda (MD): NCBI; 2020 [consultado 18 may 2025]. Disponible en: <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE161731>
+
+Love MI, Anders S, Huber W. Analyzing RNA-seq data with DESeq2 [Internet]. Bioconductor; 2025 [citado 18 may 2025]. Disponible en: <https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html>
+
+## Anexo A: Codigo completo, en <https://github.com/maria-r-g/Ramirez-Garcia-Maria-PEC2.git>
+

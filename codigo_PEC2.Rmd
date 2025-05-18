@@ -1,0 +1,410 @@
+---
+title: "codigo PEC2"
+author: "María Ramírez García"
+date: "2025-05-18"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+### Datos para el análisis
+
+#### Preparación de los datos
+
+```{r directorios}
+# Preparación de directorios
+workingDir <-getwd()
+dataDir <- file.path(workingDir, "data")
+resultsDir <- file.path(workingDir, "results")
+```
+
+```{r paquetes}
+# Paquetes requeridos
+if (!require(Rsubread)) BiocManager::install("Rsubread") # Alineación y cuantificación de lecturas
+if (!require(edgeR))BiocManager::install("edgeR") # Pre-procesado, visualización y análisis de datos de contajes
+if (!require(limma))BiocManager::install("limma") # Análisis de expresión diferencial.
+if (!require(pheatmap))BiocManager::install("pheatmap") # Editar mapas de calor
+if (!require(org.Mm.eg.db))BiocManager::install("org.Mm.db")
+if (!require(clusterProfiler))BiocManager::install("clusterProfiler")
+if (!require(factoextra)) install.packages("factoextra", dep=TRUE)
+if (!require(GEOquery))BiocManager::install("GEOquery")
+if (!require(SummarizedExperiment))BiocManager::install("SummarizedExperiment")
+if (!require(EnsDb.Hsapiens.v86))BiocManager::install("EnsDb.Hsapiens.v86")
+if (!require(tidyverse))BiocManager::install("tidyverse")
+if (!require(RNAseq123))BiocManager::install("RNAseq123")
+if (!require(topGO))BiocManager::install("topGO")
+```
+
+```{r carga_los_datos}
+# Carga y lectura de archivos
+# Cargar la matriz de recuentos
+counts <- read.csv(file.path(dataDir, "GSE161731_counts.csv.gz"), row.names = 1)
+# Cargar los metadatos de las muestras
+metadata <- read.csv(file.path(dataDir, "GSE161731_key.csv.gz"), row.names = 1)
+
+# Exploración de los datos
+# Exploración de la matriz de recuentos
+head(counts)
+colnames(counts)
+# Exploración de metadatos de muestras
+head(metadata)
+rownames(metadata)
+```
+
+```{r Normalizar_nombres_de_muestra}
+# Normalizar nombres de columnas en counts para que coincidan con metadata
+colnames(counts) <- gsub("^X", "", colnames(counts))    # elimina X inicial
+colnames(counts) <- gsub("\\.", "-", colnames(counts))  # cambia puntos por guiones
+
+# Comprobar que coinciden 
+length(intersect(colnames(counts), rownames(metadata))) # Muestras que coinciden en la matriz de recuentos con los metadatos.
+# Numero de muestras en ambos
+length(colnames(counts))
+length(rownames(metadata))
+# Descartamos las muestras que no son comunes y reorganizamos los datos
+comun_muestras <- intersect(colnames(counts), rownames(metadata))
+counts <- counts[, comun_muestras] # En las columnas, solo las muestras que son comunes
+metadata <- metadata[comun_muestras, ] # En las filas, solo las muestras communes
+```
+
+```{r categoría_de_las_variables}
+# Categoria de las columnas de metadatos
+str(metadata) # Comprueba el tipo de cada variable, la mayoria estan como cadena
+# Cambio a factor 
+metadata <- metadata %>% mutate(across(c(gender, race, cohort,time_since_onset, hospitalized, batch), as.factor))
+# Cambio a numérico
+metadata <- metadata %>% mutate(age = case_when( age == ">89" ~ 90, age == "<1"  ~ 0, TRUE ~ as.numeric(age)))
+which(is.na(metadata$age)) # comprueba que no hay NA
+# Crear nueva variable 'grupo_edad' agrupando por rangos
+metadata$g_age <- cut(metadata$age, 
+                          breaks = c(0, 15, 30, 45, 60, 75, 90),  # define los cortes de edad
+                          labels = c("0-15", "15-30", "31-45", "46-60", "61-75", "76-90"),
+                          right = TRUE,   # el intervalo incluye el valor superior 
+                          include.lowest = TRUE)  # incluir también el límite inferior
+```
+
+```{r Añadir_coordenadas_génicas}
+# Obtener coordenadas de todos los genes humanos
+cor_genes <- genes(EnsDb.Hsapiens.v86)
+
+# Identificar genes comunes entre counts y las coordenadas de todos los genes
+comun_genes <- intersect(rownames(counts), names(cor_genes))
+
+# Filtrar counts y cor_genes para seleccionar los comunes
+counts_fil <- counts[comun_genes, ]
+genes_fil <- cor_genes[comun_genes]
+
+# Verificar que son iguales
+identical(rownames(counts_fil), names(genes_fil))
+```
+
+```{r crear_summarizedExperiment}
+mySE <- SummarizedExperiment(
+  assays = list(counts = as.matrix(counts_fil)),
+  colData = metadata,
+  rowRanges = genes_fil
+)
+show(mySE)
+```
+
+```{r limpieza_y_selección}
+# Revisar si hay muestras duplicadas
+any(duplicated(colData(mySE)$subject_id))
+# Si hay duplicados, eliminar manteniendo la primera entrada
+mySE <- mySE[, !duplicated(colData(mySE)$subject_id)]
+```
+
+```{r }
+show(mySE)
+str(colData(mySE))
+```
+
+```{r categorias_mySE}
+# Cambiar simbolos en las variables raza y cohorte.
+colData(mySE)$cohort <- as.factor(gsub(" |-|/", "_", colData(mySE)$cohort))
+colData(mySE)$race   <- as.factor(gsub(" |-|/", "_", colData(mySE)$race))
+```
+
+```{r selección_cohortes}
+# Visualización de cohortes
+table(colData(mySE)$cohort)
+# Selección de COVID19, Bacterial y healthy.
+mySE <- mySE[, colData(mySE)$cohort %in% c("COVID_19", "Bacterial", "healthy")]
+```
+
+```{r selección_semilla}
+# Semilla
+myseed <- sum(utf8ToInt("mariaramirezgracia")) 
+set.seed(myseed)
+# Selección
+selec_muestras <- sample(colnames(mySE), 75)
+mySE <- mySE[, selec_muestras]
+```
+
+```{r verifica_los_resultados}
+# Verificar los resultados
+mySE
+table(colData(mySE)$cohort)
+```
+
+### Preprocesado y normalización de datos
+
+```{r obtención_CPM}
+# Calcular CPM de los counts del SummarizedExperiment
+counts_CPM <- cpm(assay(mySE, "counts"))
+# Almacena los datos de expresión normalizada como un nuevo ensayo
+assay(mySE, "CPM") <- counts_CPM
+```
+
+
+```{r filtrado}
+# Filtrar los genes
+triaje <- counts_CPM > 0.5 # Matriz booleana con TRUE donde CPM > 0.5
+triaje_genes <- rowSums(triaje) >= 2 # Genes con al menos 2 muestras con CPM > 0.5
+
+# Aplica el filtraje al SummarizedExperiment mySE y guarda uno nuevo con los datos filtrados
+mySE_filt <- mySE[triaje_genes, ]
+
+# Verificar número de genes tras el filtrado
+dim(assay(mySE, "CPM"))# Dimensiones sin filtrar genes
+dim(assay(mySE_filt, "CPM")) # Dimensiones con los genes filtrados
+```
+
+```{r orden_por_cohortes}
+# Obtener orden de las muestras según cohort
+orden <- order(colData(mySE_filt)$cohort)
+# Reordenar el SummarizedExperiment según ese orden
+mySE_filt <- mySE_filt[, orden]
+# SE realiza para una mejora visual en los gráficos, sin añadir codigo extra
+```
+
+```{r Normalización_de_los_datos_con_DGEList}
+# Crear objeto DGEList con los counts
+dge <- DGEList(counts = assay(mySE_filt, "counts"))
+
+# Normalizar al objeto DGEList
+dge_nor <- calcNormFactors(dge)
+
+# Obtener CPM normalizados
+cpm_dge_nor <- cpm(dge_nor, log = TRUE)
+```
+
+### Análisis exploratorio
+
+#### Distribución de las mmuestras
+
+```{r colores_por_cohortes}
+# Definir colores para cohortes
+colores <- c("Bacterial" = "tomato", "COVID_19" = "blue", "healthy" = "lightgreen")
+# Crear vector de colores según cohortes, 
+colores_muestras <- colores[as.character(colData(mySE_filt)$cohort)]
+```
+
+
+```{r boxplot_sin_normalizar}
+# Obtener CPM de dge
+cpm_dge <- cpm(dge, log = TRUE) 
+# Gráfico con contajes sin normalizar
+# Boxplot para observar la distribución de las muestras
+boxplot(cpm_dge, las = 2, cex.axis=0.7, main = "Distribución de expresión por muestra (sin normalizar)", ylab = "Log2 CPM", xlab="",cex.main=0.8, col=colores_muestras)
+abline(h=median(cpm_dge), col="darkblue") # Agreguemos una línea horizontal azul que corresponde a la mediana logCPM 
+```
+
+
+```{r boxplot_normalizadas, echo=FALSE}
+# Gráfico con contajes normalizado
+# Boxplot para observar la distribución de las muestras
+boxplot(cpm_dge_nor, las = 2, cex.axis=0.7, main = "Distribución de expresión por muestra ( normalizadas)", ylab = "Log2 CPM", xlab="",cex.main=0.8, col=colores_muestras)
+abline(h=median(cpm_dge_nor), col="darkblue") 
+```
+
+
+#### Comparación entre muestras
+
+```{r matriz_de_distancias}
+# Calculo de la matriz de distancias de las muestas
+muestras_dist <- dist(t(cpm_dge_nor))
+```
+
+
+```{r Dendrograma}
+# Agrupamiento jerárquico: Dendrograma
+library(dendextend)
+# crea dendrograma
+dend <- as.dendrogram(hclust(muestras_dist))
+# Asignar colores a etiquetas
+labels_colors(dend) <- colores[as.character(colData(mySE_filt)$cohort)][order.dendrogram(dend)]
+# Acortar los nombres de las etiquetas a los primeros 6 caracteres
+labels(dend) <- substr(labels(dend), 1, 6) # Visualizar mejor el gráfico
+# Graficar dendrograma
+plot(dend, main = "Dendrograma de distancias de muestra", xlab = "Muestras", ylab = "Distancia Euclídea" )
+legend("topright", legend = names(colores), fill = colores, cex=0.5)
+```
+
+
+```{r Heatmap}
+# Crear un data.frame con los colores de cohortes
+annotation_col <- data.frame(Cohorte = colData(mySE_filt)$cohort)
+rownames(annotation_col) <- colnames(mySE_filt)
+
+# Definir los colores para cohortes
+ann_colors <- list(Cohorte = colores)
+
+# Heatmap de distancias
+pheatmap(muestras_dist,
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         main = "Heatmap de distancias entre muestras",
+         show_rownames = FALSE, # Oculta nombres de filas
+         show_colnames = FALSE, # Oculta nombres de columnas
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete")
+
+```
+
+
+```{r MDS}
+# Crear MDS para las muestras
+limma::plotMDS(cpm_dge_nor,col=colores_muestras, main="MDS por cohortes", cex=0.7)
+```
+
+```{r Batch}
+# Crear vector de colores para los batch
+batch_col <- unique(colData(mySE_filt)$batch)
+# Asignar colores a cada batch
+batch_colores <- rainbow(length(batch_col))
+names(batch_colores) <- batch_col
+# Asignar color a cada muestra según su batch
+col_batch <- batch_colores[as.character(colData(mySE_filt)$batch)]
+
+# Visualizar relación batch-color
+data.frame(Muestra = colnames(mySE), Batch = colData(mySE)$batch, Color = col_batch)
+
+# grafico 
+limma::plotMDS(cpm_dge_nor, col = col_batch, main = "MDS por Batch", cex = 0.7)
+
+# Leyenda
+legend("topright", legend = names(batch_colores), fill = batch_colores, cex=0.5)
+```
+
+
+```{r eliminación_outliers}
+# Posibles outliers
+outliers <- c("95967", "97392", "94189", "DU18-02S0011619", "DU18-02S0011639", "DU09-02S0000151")
+# Elimina outliers del SummarizedExperiment
+mySE_filt <- mySE_filt[, !colnames(mySE_filt) %in% outliers]
+dim(assay(mySE_filt, "CPM")) # Comprobbar que eliminó las 6 muestras (75-6=69)
+```
+
+
+```{r include=FALSE}
+# Selección del metodo para el analisis
+set.seed(myseed)
+metodo <- sample(c("edgeR", "voom+limma", "DESeq2"), size = 1)
+metodo
+```
+
+
+```{r creear objeto_S4, include=FALSE}
+# Situar heathly como referencia de los factores
+colData(mySE_filt)$cohort <- relevel(colData(mySE_filt)$cohort, ref = "healthy")
+
+# Elimina los niveles de cohort que estan vacios 
+colData(mySE_filt)$cohort <- droplevels(colData(mySE_filt)$cohort)
+levels(colData(mySE_filt)$cohort) # comprueba que solo quedan healthy, Bacterial y COVID_19
+
+# Crear objeto DESeqDataSet desde el RangedSummarizedExperiment (mySE_filt)
+library("DESeq2")
+dds <- DESeqDataSet(mySE_filt, design = ~ batch + race + gender + cohort)
+# Ejecutar
+dds <- DESeq(dds)
+```
+
+
+```{r }
+# Extrar las martiz de diseño
+matriz_dis <- model.matrix(design(dds), data=colData(dds)) # Extrae la fórmula con design(dds) y toma los datos de colData(dds).  
+```
+
+
+```{r contrastes}
+# En DESeq2 los contrastes se especifican directamente al extraer los resultados con results(), no se crean matrices explicitas
+# Bacterial vs healthy
+res_bacterial <- results(dds, contrast = c("cohort", "Bacterial", "healthy"))
+head(res_bacterial) # Visualizar los resultados de los primeros genes
+
+# COVID-19 vs healthy
+res_covid <- results(dds, contrast = c("cohort", "COVID_19", "healthy"))
+head(res_covid) #Visualizar los resultados de los primeros genes
+
+# coeficientes para construir los contrastes
+resultsNames(dds)
+```
+
+
+```{r }
+# Filtra valores con el p-valor ajustado <0.05 &
+# Filtra por una diferencia de expresión de al menos 2.8 veces entre los grupos.
+
+# Filtrar resultados para Bacterial vs healthy
+res_bacterial_sig <- res_bacterial[which(res_bacterial$padj < 0.05 & abs(res_bacterial$log2FoldChange) > 1.5), ] 
+head(res_bacterial_sig)
+nrow(res_bacterial_sig)  # Número de genes significativos y con alto cambio
+
+# Filtrar resultados para COVID-19 vs healthy
+res_covid_sig <- res_covid[which(res_covid$padj < 0.05 & abs(res_covid$log2FoldChange) > 1.5), ]
+head(res_covid_sig)
+nrow(res_covid_sig)  # Número de genes significativos y con alto cambio
+```
+
+
+#### Contrastes para los perfiles con neumonía bacteriana y COVID-19
+
+```{r}
+# Diagrama de Venn
+library("ggvenn")
+
+# Crea una lista con los genes diferencialmente expresados en cada contraste
+Venn<-list("Bacterial_vs_healthy"=c(rownames(res_bacterial_sig)),"COVID19 vs healthy"=c(rownames(res_covid_sig)))
+
+# Generar el diagrama de Venn con los conjuntos definidos
+ggvenn(Venn, fill_color = c( "tomato", "blue"),
+  stroke_size = 0.6, 
+  set_name_size = 6)
+```
+
+### Análisis de sobrerepresentación
+
+```{r topGO}
+library(topGO)
+
+# Crea un vector con todos los genes y su log2FC
+geneList <- res_covid$log2FoldChange  # todos los genes evaluados
+names(geneList) <- rownames(res_covid)  # IDs como nombres
+geneList[is.na(geneList)] <- 0     # evita NAs
+
+# Lista de genes significativos creada anteriormente
+sigGenes <- rownames(res_covid_sig) 
+
+# Función de selección: TRUE cuando el gen está en sigGenes
+geneSelection <- function(allScore) {
+  names(allScore) %in% sigGenes }
+
+# Crear el objeto topGOdata
+GOdata <- new("topGOdata",
+              ontology      = "BP",
+              allGenes      = geneList,
+              geneSel       = geneSelection,
+              annotationFun = annFUN.org,
+              mapping       = "org.Hs.eg.db", 
+              ID            = "ENSEMBL")      # IDs de Ensembl
+
+# Visualizar 
+GOdata  # Resumen
+sum(geneSelection(geneList))  # número de genes seleccionados
+```
